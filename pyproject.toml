@@ -1,0 +1,15 @@
+[project]
+name = "comfyui-referencechain"
+description = "A ComfyUI node that takes multiple images, scales them, VAE encodes them, and chains them as reference latents into a single conditioning output. Useful for edit models like Flux-2-klein that accept multiple reference images."
+version = "1.0.0"
+license = {text = "MIT"}
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/remingtonspaz/ComfyUI-ReferenceChain"
+# Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = "remingtonspaz"
+DisplayName = "ComfyUI-ReferenceChain"
+# Icon = "https://example.com/icon.png"
