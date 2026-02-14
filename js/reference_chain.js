@@ -563,6 +563,41 @@ app.registerExtension({
                 customWidget.updateNodeSize();
             }
 
+            // Remove the default image_input_1 slot (created from optional INPUT_TYPES)
+            // since image_input_node_count defaults to 0
+            const defaultImageInput = this.inputs?.findIndex(input => input.name === "image_input_1");
+            if (defaultImageInput !== undefined && defaultImageInput >= 0) {
+                this.removeInput(defaultImageInput);
+            }
+
+            // Add "Update image inputs" button for dynamic IMAGE input slots
+            this.addWidget("button", "Update image inputs", null, () => {
+                if (!this.inputs) {
+                    this.inputs = [];
+                }
+                const target = this.widgets.find(w => w.name === "image_input_node_count")?.value || 0;
+                const current = this.inputs.filter(input => input.type === "IMAGE").length;
+                if (target === current) return;
+
+                if (target < current) {
+                    // Remove excess IMAGE inputs from the end
+                    for (let i = 0; i < current - target; i++) {
+                        // Find the last IMAGE input and remove it
+                        for (let j = this.inputs.length - 1; j >= 0; j--) {
+                            if (this.inputs[j].type === "IMAGE") {
+                                this.removeInput(j);
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    // Add new IMAGE inputs
+                    for (let i = current + 1; i <= target; i++) {
+                        this.addInput(`image_input_${i}`, "IMAGE", { shape: 7 });
+                    }
+                }
+            });
+
             return result;
         };
 

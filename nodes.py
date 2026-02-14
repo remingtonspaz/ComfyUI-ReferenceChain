@@ -42,6 +42,15 @@ class ReferenceChainConditioning:
                     "multiline": False,
                     "image_list_upload": True,  # Custom flag for frontend
                 }),
+                "image_input_node_count": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 1000,
+                    "step": 1,
+                }),
+            },
+            "optional": {
+                "image_input_1": ("IMAGE",),
             }
         }
 
@@ -106,22 +115,50 @@ class ReferenceChainConditioning:
         s = s.movedim(1, -1)
         return s
 
-    def process(self, conditioning, neg_conditioning, vae, upscale_method, scale_megapixels, images):
+    def _encode_and_append(self, image_tensor, vae, upscale_method, scale_megapixels,
+                            result_conditioning, result_neg_conditioning, first_scaled_image):
+        """Scale, VAE-encode a single image tensor and append to conditioning."""
+        scaled_image = self.scale_image(image_tensor, upscale_method, scale_megapixels)
+
+        if first_scaled_image is None:
+            first_scaled_image = scaled_image
+
+        latent_samples = vae.encode(scaled_image[:, :, :, :3])
+
+        result_conditioning = node_helpers.conditioning_set_values(
+            result_conditioning,
+            {"reference_latents": [latent_samples]},
+            append=True
+        )
+        result_neg_conditioning = node_helpers.conditioning_set_values(
+            result_neg_conditioning,
+            {"reference_latents": [latent_samples]},
+            append=True
+        )
+
+        return result_conditioning, result_neg_conditioning, first_scaled_image
+
+    def process(self, conditioning, neg_conditioning, vae, upscale_method, scale_megapixels, image_input_node_count, images, **kwargs):
         """
         Process multiple images and chain them as reference latents.
-
-        Args:
-            conditioning: Input conditioning to append reference latents to
-            neg_conditioning: Input negative conditioning to append reference latents to
-            vae: VAE model for encoding images to latents
-            upscale_method: Method for scaling images
-            scale_megapixels: Target megapixels for image scaling
-            images: JSON array of image filenames
-
-        Returns:
-            Conditioning with all reference latents appended
+        Images come from two sources: uploaded files (via the widget) and
+        IMAGE node inputs (image_input_1, image_input_2, ...).
         """
-        # Parse JSON array of image filenames
+        result_conditioning = conditioning
+        result_neg_conditioning = neg_conditioning
+        first_scaled_image = None
+
+        # 1. Process IMAGE node inputs first (image_input_1, image_input_2, ...)
+        for i in range(1, image_input_node_count + 1):
+            image_tensor = kwargs.get(f"image_input_{i}")
+            if image_tensor is None:
+                continue
+
+            result_conditioning, result_neg_conditioning, first_scaled_image = \
+                self._encode_and_append(image_tensor, vae, upscale_method, scale_megapixels,
+                                        result_conditioning, result_neg_conditioning, first_scaled_image)
+
+        # 2. Process uploaded images from the drag-and-drop widget
         try:
             images_list = json.loads(images)
         except json.JSONDecodeError:
@@ -130,64 +167,28 @@ class ReferenceChainConditioning:
         if not isinstance(images_list, list):
             images_list = []
 
-        # Filter out empty strings
         images_list = [img for img in images_list if img and isinstance(img, str)]
 
-        # If no images, return conditioning unchanged with empty image
-        if not images_list:
-            # Return empty 1x1 black image as placeholder
-            empty_image = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
-            return (conditioning, neg_conditioning, empty_image)
-
-        # Process each image
-        result_conditioning = conditioning
-        result_neg_conditioning = neg_conditioning
-        first_scaled_image = None
-
         for image_filename in images_list:
-            # Get full path using folder_paths
             image_path = folder_paths.get_annotated_filepath(image_filename)
 
             if not os.path.exists(image_path):
                 print(f"[ReferenceChainConditioning] Warning: Image not found: {image_path}")
                 continue
 
-            # Load image
             image_tensor = self.load_image(image_path)
+            result_conditioning, result_neg_conditioning, first_scaled_image = \
+                self._encode_and_append(image_tensor, vae, upscale_method, scale_megapixels,
+                                        result_conditioning, result_neg_conditioning, first_scaled_image)
 
-            # Scale to target megapixels
-            scaled_image = self.scale_image(image_tensor, upscale_method, scale_megapixels)
-
-            # Store first scaled image for output
-            if first_scaled_image is None:
-                first_scaled_image = scaled_image
-
-            # VAE encode
-            # VAE expects BHWC format with values 0-1
-            latent_samples = vae.encode(scaled_image[:, :, :, :3])
-
-            # Append to conditioning using the same method as ReferenceLatent
-            result_conditioning = node_helpers.conditioning_set_values(
-                result_conditioning,
-                {"reference_latents": [latent_samples]},
-                append=True
-            )
-            
-            # Append to negative conditioning as well
-            result_neg_conditioning = node_helpers.conditioning_set_values(
-                result_neg_conditioning,
-                {"reference_latents": [latent_samples]},
-                append=True
-            )
-
-        # Ensure we have a first image (fallback to empty if somehow none processed)
+        # Fallback if no images were processed
         if first_scaled_image is None:
             first_scaled_image = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
 
         return (result_conditioning, result_neg_conditioning, first_scaled_image)
 
     @classmethod
-    def IS_CHANGED(cls, conditioning, neg_conditioning, vae, upscale_method, scale_megapixels, images):
+    def IS_CHANGED(cls, conditioning, neg_conditioning, vae, upscale_method, scale_megapixels, image_input_node_count, images, **kwargs):
         """Check if the node needs to be re-executed based on image changes."""
         try:
             images_list = json.loads(images)
@@ -213,7 +214,7 @@ class ReferenceChainConditioning:
         return m.digest().hex()
 
     @classmethod
-    def VALIDATE_INPUTS(cls, conditioning, neg_conditioning, vae, upscale_method, scale_megapixels, images):
+    def VALIDATE_INPUTS(cls, conditioning, neg_conditioning, vae, upscale_method, scale_megapixels, image_input_node_count, images, **kwargs):
         """Validate that all specified images exist."""
         try:
             images_list = json.loads(images)
