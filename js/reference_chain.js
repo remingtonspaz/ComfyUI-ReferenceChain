@@ -21,6 +21,11 @@ class ImageListWidget {
         this.type = "custom";
         this.options = { serialize: true };
 
+        // Marker used instead of `instanceof`: ComfyUI's frontend copies this
+        // widget's own properties onto a LegacyWidget wrapper when it is put
+        // into node.widgets, so the prototype chain is lost but the flag isn't.
+        this.isImageListWidget = true;
+
         // Array of image filenames
         this._images = [];
 
@@ -131,6 +136,7 @@ class ImageListWidget {
     addImage(filename) {
         if (filename && !this._images.includes(filename)) {
             this._images.push(filename);
+            this.syncValue();
             this.preloadImages();
             this.updateNodeSize();
             this.node?.setDirtyCanvas(true, true);
@@ -144,6 +150,7 @@ class ImageListWidget {
         if (index >= 0 && index < this._images.length) {
             const filename = this._images[index];
             this._images.splice(index, 1);
+            this.syncValue();
             this.imageCache.delete(filename);
             this.updateNodeSize();
             this.node?.setDirtyCanvas(true, true);
@@ -522,8 +529,36 @@ class ImageListWidget {
      * Serialize widget value
      */
     serializeValue() {
-        return this.value;
+        return JSON.stringify(this._images);
     }
+
+    /**
+     * Push the image list onto the widget's own `value` property.
+     *
+     * When this widget is wrapped in a LegacyWidget the wrapper installs its
+     * own `value` accessor, which shadows this class's getter — so `value`
+     * would otherwise go stale and the workflow would save an empty list.
+     */
+    syncValue() {
+        const serialized = JSON.stringify(this._images);
+        if (this.value !== serialized) {
+            this.value = serialized;
+        }
+    }
+}
+
+/**
+ * Resolve the images widget on a node.
+ *
+ * Do not use `instanceof ImageListWidget` here: the frontend wraps custom
+ * widgets in a LegacyWidget, so the instance in node.widgets is a different
+ * class that merely carries our properties.
+ */
+function getImageListWidget(node) {
+    const widget = node.widgets?.find((w) => w.name === "images");
+    return widget?.isImageListWidget && typeof widget.uploadImage === "function"
+        ? widget
+        : null;
 }
 
 /**
@@ -610,8 +645,8 @@ app.registerExtension({
                 e.preventDefault();
 
                 // Update drop zone highlight
-                const widget = this.widgets?.find((w) => w.name === "images");
-                if (widget && widget instanceof ImageListWidget) {
+                const widget = getImageListWidget(this);
+                if (widget) {
                     if (!widget.dropZoneActive) {
                         widget.dropZoneActive = true;
                         this.setDirtyCanvas(true, true);
@@ -629,8 +664,8 @@ app.registerExtension({
             const result = onDragLeave?.apply(this, arguments);
 
             // Clear drop zone highlight
-            const widget = this.widgets?.find((w) => w.name === "images");
-            if (widget && widget instanceof ImageListWidget) {
+            const widget = getImageListWidget(this);
+            if (widget) {
                 if (widget.dropZoneActive) {
                     widget.dropZoneActive = false;
                     this.setDirtyCanvas(true, true);
@@ -643,14 +678,14 @@ app.registerExtension({
         const onDragDrop = nodeType.prototype.onDragDrop;
         nodeType.prototype.onDragDrop = async function (e) {
             // Clear drop zone highlight
-            const widget = this.widgets?.find((w) => w.name === "images");
-            if (widget && widget instanceof ImageListWidget) {
+            const widget = getImageListWidget(this);
+            if (widget) {
                 widget.dropZoneActive = false;
                 this.setDirtyCanvas(true, true);
             }
 
             if (e.dataTransfer?.files?.length > 0) {
-                if (widget && widget instanceof ImageListWidget) {
+                if (widget) {
                     for (const file of e.dataTransfer.files) {
                         if (file.type.startsWith("image/")) {
                             await widget.uploadImage(file);
@@ -666,8 +701,8 @@ app.registerExtension({
         // Handle paste
         const onPaste = nodeType.prototype.onPaste;
         nodeType.prototype.onPaste = async function (e) {
-            const widget = this.widgets?.find((w) => w.name === "images");
-            if (widget && widget instanceof ImageListWidget) {
+            const widget = getImageListWidget(this);
+            if (widget) {
                 const items = e.clipboardData?.items;
                 if (items) {
                     for (const item of items) {
