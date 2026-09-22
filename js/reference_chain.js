@@ -611,7 +611,7 @@ app.registerExtension({
 
                 // Update drop zone highlight
                 const widget = this.widgets?.find((w) => w.name === "images");
-                if (widget && widget instanceof ImageListWidget) {
+                if (typeof widget?.uploadImage === "function") {
                     if (!widget.dropZoneActive) {
                         widget.dropZoneActive = true;
                         this.setDirtyCanvas(true, true);
@@ -630,7 +630,7 @@ app.registerExtension({
 
             // Clear drop zone highlight
             const widget = this.widgets?.find((w) => w.name === "images");
-            if (widget && widget instanceof ImageListWidget) {
+            if (typeof widget?.uploadImage === "function") {
                 if (widget.dropZoneActive) {
                     widget.dropZoneActive = false;
                     this.setDirtyCanvas(true, true);
@@ -644,13 +644,13 @@ app.registerExtension({
         nodeType.prototype.onDragDrop = async function (e) {
             // Clear drop zone highlight
             const widget = this.widgets?.find((w) => w.name === "images");
-            if (widget && widget instanceof ImageListWidget) {
+            if (typeof widget?.uploadImage === "function") {
                 widget.dropZoneActive = false;
                 this.setDirtyCanvas(true, true);
             }
 
             if (e.dataTransfer?.files?.length > 0) {
-                if (widget && widget instanceof ImageListWidget) {
+                if (typeof widget?.uploadImage === "function") {
                     for (const file of e.dataTransfer.files) {
                         if (file.type.startsWith("image/")) {
                             await widget.uploadImage(file);
@@ -667,7 +667,7 @@ app.registerExtension({
         const onPaste = nodeType.prototype.onPaste;
         nodeType.prototype.onPaste = async function (e) {
             const widget = this.widgets?.find((w) => w.name === "images");
-            if (widget && widget instanceof ImageListWidget) {
+            if (typeof widget?.uploadImage === "function") {
                 const items = e.clipboardData?.items;
                 if (items) {
                     for (const item of items) {
