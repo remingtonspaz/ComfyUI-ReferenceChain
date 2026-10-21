@@ -11,18 +11,22 @@ const SLOT_PADDING = 8;
 const REMOVE_BUTTON_SIZE = 16;
 
 /**
- * Custom widget for managing a list of images with previews
+ * Display-only widget for managing a list of images with previews.
+ * The list itself lives in the node's hidden "images" STRING widget (valueWidget),
+ * which is the widget that gets serialized into workflows and prompts.
  * Styled to match ComfyUI's LoadImage node
  */
 class ImageListWidget {
-    constructor(node, inputName, inputData) {
+    constructor(node, valueWidget) {
         this.node = node;
-        this.name = inputName;
+        this.name = "images_ui";
         this.type = "custom";
-        this.options = { serialize: true };
+        this.serialize = false;
+        this.options = { serialize: false };
+        this.valueWidget = valueWidget;
 
-        // Array of image filenames
-        this._images = [];
+        // Own-property marker: newer frontends re-parent custom widgets, so instanceof can't be used
+        this.isReferenceChainList = true;
 
         // Cache for loaded image elements with dimensions
         this.imageCache = new Map();
@@ -38,57 +42,29 @@ class ImageListWidget {
 
         // Hover/drag state for drop zone
         this.dropZoneActive = false;
-
-        // Initialize from default value
-        try {
-            const defaultVal = inputData?.[1]?.default || "[]";
-            this._images = JSON.parse(defaultVal);
-            if (!Array.isArray(this._images)) {
-                this._images = [];
-            }
-        } catch (e) {
-            this._images = [];
-        }
-    }
-
-    get value() {
-        return JSON.stringify(this._images);
-    }
-
-    set value(v) {
-        try {
-            if (typeof v === "string") {
-                this._images = JSON.parse(v);
-            } else if (Array.isArray(v)) {
-                this._images = v;
-            } else {
-                this._images = [];
-            }
-        } catch (e) {
-            this._images = [];
-        }
-        if (!Array.isArray(this._images)) {
-            this._images = [];
-        }
-
-        // Preload images
-        this.preloadImages();
-
-        // Request redraw
-        if (this.node) {
-            this.node.setDirtyCanvas(true, true);
-        }
     }
 
     get images() {
-        return this._images;
+        let images;
+        try {
+            images = JSON.parse(this.valueWidget.value || "[]");
+        } catch (e) {
+            images = [];
+        }
+        return Array.isArray(images) ? images.filter((img) => img && typeof img === "string") : [];
+    }
+
+    setImages(images) {
+        this.valueWidget.value = JSON.stringify(images);
+        this.preloadImages();
+        this.updateNodeSize();
     }
 
     /**
      * Preload images into cache
      */
     preloadImages() {
-        for (const filename of this._images) {
+        for (const filename of this.images) {
             if (!this.imageCache.has(filename)) {
                 const img = new Image();
                 img.src = `/view?filename=${encodeURIComponent(filename)}&type=input`;
@@ -120,7 +96,7 @@ class ImageListWidget {
      * Calculate widget height based on number of images
      */
     computeSize() {
-        const numImages = this._images.length;
+        const numImages = this.images.length;
         const height = (numImages * this.getSlotHeight()) + DROP_ZONE_HEIGHT + SLOT_PADDING + BUTTON_HEIGHT + SLOT_PADDING * 2;
         return [this.node?.size?.[0] || 200, height];
     }
@@ -129,11 +105,10 @@ class ImageListWidget {
      * Add an image to the list
      */
     addImage(filename) {
-        if (filename && !this._images.includes(filename)) {
-            this._images.push(filename);
-            this.preloadImages();
-            this.updateNodeSize();
-            this.node?.setDirtyCanvas(true, true);
+        const images = this.images;
+        if (filename && !images.includes(filename)) {
+            images.push(filename);
+            this.setImages(images);
         }
     }
 
@@ -141,12 +116,11 @@ class ImageListWidget {
      * Remove an image from the list
      */
     removeImage(index) {
-        if (index >= 0 && index < this._images.length) {
-            const filename = this._images[index];
-            this._images.splice(index, 1);
+        const images = this.images;
+        if (index >= 0 && index < images.length) {
+            const [filename] = images.splice(index, 1);
             this.imageCache.delete(filename);
-            this.updateNodeSize();
-            this.node?.setDirtyCanvas(true, true);
+            this.setImages(images);
         }
     }
 
@@ -165,6 +139,7 @@ class ImageListWidget {
         if (widgetIndex > 0) {
             for (let i = 0; i < widgetIndex; i++) {
                 const w = this.node.widgets[i];
+                if (w.hidden) continue;
                 // Standard widget height is ~20-26px, use 26 as safe default
                 otherWidgetsHeight += (w.computedHeight || 26) + 4;
             }
@@ -258,6 +233,10 @@ class ImageListWidget {
         const x = margin;
         const width = widgetWidth - margin * 2;
 
+        const images = this.images;
+        // Covers values restored on workflow load, which bypass setImages
+        this.preloadImages();
+
         ctx.save();
 
         let currentY = y + SLOT_PADDING;
@@ -267,8 +246,8 @@ class ImageListWidget {
         this._slotPositions = [];
 
         // Draw each image slot
-        for (let i = 0; i < this._images.length; i++) {
-            const filename = this._images[i];
+        for (let i = 0; i < images.length; i++) {
+            const filename = images[i];
             const slotY = currentY + i * slotHeight;
 
             // Get cached image data
@@ -390,7 +369,7 @@ class ImageListWidget {
         }
 
         // --- Drop zone area ---
-        const dropZoneY = currentY + this._images.length * slotHeight + SLOT_PADDING;
+        const dropZoneY = currentY + images.length * slotHeight + SLOT_PADDING;
 
         // Drop zone background
         ctx.fillStyle = this.dropZoneActive ? "#2a2a2a" : "#1a1a1a";
@@ -517,13 +496,10 @@ class ImageListWidget {
 
         return false;
     }
+}
 
-    /**
-     * Serialize widget value
-     */
-    serializeValue() {
-        return this.value;
-    }
+function getImageListWidget(node) {
+    return node.widgets?.find((w) => w.isReferenceChainList);
 }
 
 /**
@@ -543,24 +519,17 @@ app.registerExtension({
         nodeType.prototype.onNodeCreated = function () {
             const result = onNodeCreated?.apply(this, arguments);
 
-            // Find the images widget and replace it
+            // Keep the "images" STRING widget as the serialized value (same position, so old
+            // workflows restore into it) and show a display-only list widget right after it
             const imagesWidget = this.widgets?.find((w) => w.name === "images");
             if (imagesWidget) {
-                // Get index
-                const index = this.widgets.indexOf(imagesWidget);
+                imagesWidget.hidden = true;
 
-                // Create custom widget
-                const customWidget = new ImageListWidget(
-                    this,
-                    "images",
-                    nodeData.input?.required?.images
-                );
+                const listWidget = this.addCustomWidget(new ImageListWidget(this, imagesWidget));
+                this.widgets.splice(this.widgets.indexOf(listWidget), 1);
+                this.widgets.splice(this.widgets.indexOf(imagesWidget) + 1, 0, listWidget);
 
-                // Replace widget
-                this.widgets[index] = customWidget;
-
-                // Initialize size
-                customWidget.updateNodeSize();
+                listWidget.updateNodeSize();
             }
 
             // Remove the default image_input_1 slot (created from optional INPUT_TYPES)
@@ -601,6 +570,14 @@ app.registerExtension({
             return result;
         };
 
+        // Resize to fit images restored from a saved workflow
+        const onConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function () {
+            const result = onConfigure?.apply(this, arguments);
+            getImageListWidget(this)?.updateNodeSize();
+            return result;
+        };
+
         // Handle drag and drop
         const onDragOver = nodeType.prototype.onDragOver;
         nodeType.prototype.onDragOver = function (e) {
@@ -610,8 +587,8 @@ app.registerExtension({
                 e.preventDefault();
 
                 // Update drop zone highlight
-                const widget = this.widgets?.find((w) => w.name === "images");
-                if (widget && widget instanceof ImageListWidget) {
+                const widget = getImageListWidget(this);
+                if (widget) {
                     if (!widget.dropZoneActive) {
                         widget.dropZoneActive = true;
                         this.setDirtyCanvas(true, true);
@@ -629,8 +606,8 @@ app.registerExtension({
             const result = onDragLeave?.apply(this, arguments);
 
             // Clear drop zone highlight
-            const widget = this.widgets?.find((w) => w.name === "images");
-            if (widget && widget instanceof ImageListWidget) {
+            const widget = getImageListWidget(this);
+            if (widget) {
                 if (widget.dropZoneActive) {
                     widget.dropZoneActive = false;
                     this.setDirtyCanvas(true, true);
@@ -643,14 +620,14 @@ app.registerExtension({
         const onDragDrop = nodeType.prototype.onDragDrop;
         nodeType.prototype.onDragDrop = async function (e) {
             // Clear drop zone highlight
-            const widget = this.widgets?.find((w) => w.name === "images");
-            if (widget && widget instanceof ImageListWidget) {
+            const widget = getImageListWidget(this);
+            if (widget) {
                 widget.dropZoneActive = false;
                 this.setDirtyCanvas(true, true);
             }
 
             if (e.dataTransfer?.files?.length > 0) {
-                if (widget && widget instanceof ImageListWidget) {
+                if (widget) {
                     for (const file of e.dataTransfer.files) {
                         if (file.type.startsWith("image/")) {
                             await widget.uploadImage(file);
@@ -666,8 +643,8 @@ app.registerExtension({
         // Handle paste
         const onPaste = nodeType.prototype.onPaste;
         nodeType.prototype.onPaste = async function (e) {
-            const widget = this.widgets?.find((w) => w.name === "images");
-            if (widget && widget instanceof ImageListWidget) {
+            const widget = getImageListWidget(this);
+            if (widget) {
                 const items = e.clipboardData?.items;
                 if (items) {
                     for (const item of items) {
