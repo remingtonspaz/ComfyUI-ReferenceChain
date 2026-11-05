@@ -14,6 +14,71 @@ import node_helpers
 import comfy.utils
 
 
+def load_image(image_path):
+    """Load a single image from the input directory and convert to tensor."""
+    img = node_helpers.pillow(Image.open, image_path)
+
+    output_images = []
+    w, h = None, None
+
+    for i in ImageSequence.Iterator(img):
+        i = node_helpers.pillow(ImageOps.exif_transpose, i)
+
+        if i.mode == 'I':
+            i = i.point(lambda x: x * (1 / 255))
+        image = i.convert("RGB")
+
+        if len(output_images) == 0:
+            w = image.size[0]
+            h = image.size[1]
+
+        if image.size[0] != w or image.size[1] != h:
+            continue
+
+        image = np.array(image).astype(np.float32) / 255.0
+        image = torch.from_numpy(image)[None,]
+        output_images.append(image)
+
+        if img.format == "MPO":
+            break  # ignore all frames except the first one for MPO format
+
+    if len(output_images) > 1:
+        output_image = torch.cat(output_images, dim=0)
+    elif len(output_images) == 1:
+        output_image = output_images[0]
+    else:
+        raise ValueError(f"Could not load image from {image_path}")
+
+    return output_image
+
+
+def parse_image_list(images):
+    try:
+        images_list = json.loads(images)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(images_list, list):
+        return []
+    return [img for img in images_list if img and isinstance(img, str)]
+
+
+def hash_image_files(images):
+    m = hashlib.sha256()
+    for image_filename in parse_image_list(images):
+        image_path = folder_paths.get_annotated_filepath(image_filename)
+        if os.path.exists(image_path):
+            with open(image_path, 'rb') as f:
+                m.update(f.read())
+    return m.digest().hex()
+
+
+def validate_image_list(images):
+    for image_filename in parse_image_list(images):
+        if not folder_paths.exists_annotated_filepath(image_filename):
+            return f"Invalid image file: {image_filename}"
+    return True
+
+
 class ReferenceChainConditioning:
     """
     A node that takes multiple images as input through a dynamic list UI,
@@ -58,43 +123,6 @@ class ReferenceChainConditioning:
     RETURN_NAMES = ("conditioning", "neg_conditioning", "first_image_scaled")
     FUNCTION = "process"
     CATEGORY = "conditioning"
-
-    def load_image(self, image_path):
-        """Load a single image from the input directory and convert to tensor."""
-        img = node_helpers.pillow(Image.open, image_path)
-
-        output_images = []
-        w, h = None, None
-
-        for i in ImageSequence.Iterator(img):
-            i = node_helpers.pillow(ImageOps.exif_transpose, i)
-
-            if i.mode == 'I':
-                i = i.point(lambda x: x * (1 / 255))
-            image = i.convert("RGB")
-
-            if len(output_images) == 0:
-                w = image.size[0]
-                h = image.size[1]
-
-            if image.size[0] != w or image.size[1] != h:
-                continue
-
-            image = np.array(image).astype(np.float32) / 255.0
-            image = torch.from_numpy(image)[None,]
-            output_images.append(image)
-
-            if img.format == "MPO":
-                break  # ignore all frames except the first one for MPO format
-
-        if len(output_images) > 1:
-            output_image = torch.cat(output_images, dim=0)
-        elif len(output_images) == 1:
-            output_image = output_images[0]
-        else:
-            raise ValueError(f"Could not load image from {image_path}")
-
-        return output_image
 
     def scale_image(self, image, upscale_method, megapixels):
         """Scale image to target megapixels."""
@@ -159,15 +187,7 @@ class ReferenceChainConditioning:
                                         result_conditioning, result_neg_conditioning, first_scaled_image)
 
         # 2. Process uploaded images from the drag-and-drop widget
-        try:
-            images_list = json.loads(images)
-        except json.JSONDecodeError:
-            images_list = []
-
-        if not isinstance(images_list, list):
-            images_list = []
-
-        images_list = [img for img in images_list if img and isinstance(img, str)]
+        images_list = parse_image_list(images)
 
         for image_filename in images_list:
             image_path = folder_paths.get_annotated_filepath(image_filename)
@@ -176,7 +196,7 @@ class ReferenceChainConditioning:
                 print(f"[ReferenceChainConditioning] Warning: Image not found: {image_path}")
                 continue
 
-            image_tensor = self.load_image(image_path)
+            image_tensor = load_image(image_path)
             result_conditioning, result_neg_conditioning, first_scaled_image = \
                 self._encode_and_append(image_tensor, vae, upscale_method, scale_megapixels,
                                         result_conditioning, result_neg_conditioning, first_scaled_image)
@@ -190,48 +210,55 @@ class ReferenceChainConditioning:
     @classmethod
     def IS_CHANGED(cls, conditioning, neg_conditioning, vae, upscale_method, scale_megapixels, image_input_node_count, images, **kwargs):
         """Check if the node needs to be re-executed based on image changes."""
-        try:
-            images_list = json.loads(images)
-        except json.JSONDecodeError:
-            return ""
-
-        if not isinstance(images_list, list):
-            return ""
-
-        # Create a hash of all image files
-        m = hashlib.sha256()
-
-        for image_filename in images_list:
-            if not image_filename or not isinstance(image_filename, str):
-                continue
-
-            image_path = folder_paths.get_annotated_filepath(image_filename)
-
-            if os.path.exists(image_path):
-                with open(image_path, 'rb') as f:
-                    m.update(f.read())
-
-        return m.digest().hex()
+        return hash_image_files(images)
 
     @classmethod
     def VALIDATE_INPUTS(cls, conditioning, neg_conditioning, vae, upscale_method, scale_megapixels, image_input_node_count, images, **kwargs):
         """Validate that all specified images exist."""
-        try:
-            images_list = json.loads(images)
-        except json.JSONDecodeError:
-            return True  # Empty/invalid JSON is okay, just means no images
+        return validate_image_list(images)
 
-        if not isinstance(images_list, list):
-            return True
 
-        for image_filename in images_list:
-            if not image_filename or not isinstance(image_filename, str):
-                continue
+class ReferenceImageBank:
+    """
+    Drag-and-drop image list with one IMAGE output per image, for feeding nodes
+    with growing image inputs (Set Reference Multi Latent, Text Encode Qwen Image 2.1, ...).
+    The frontend shows one output per image and wires new outputs into the next free
+    slot of whatever node image_1 is connected to. Unused outputs send None, which
+    those nodes skip.
+    """
 
-            if not folder_paths.exists_annotated_filepath(image_filename):
-                return f"Invalid image file: {image_filename}"
+    MAX_IMAGES = 16
 
-        return True
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("STRING", {
+                    "default": "[]",
+                    "multiline": False,
+                    "image_list_upload": True,
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",) * MAX_IMAGES
+    RETURN_NAMES = tuple(f"image_{i}" for i in range(1, MAX_IMAGES + 1))
+    FUNCTION = "load"
+    CATEGORY = "image"
+
+    def load(self, images):
+        outputs = [None] * self.MAX_IMAGES
+        for i, image_filename in enumerate(parse_image_list(images)[:self.MAX_IMAGES]):
+            outputs[i] = load_image(folder_paths.get_annotated_filepath(image_filename))
+        return tuple(outputs)
+
+    @classmethod
+    def IS_CHANGED(cls, images):
+        return hash_image_files(images)
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, images):
+        return validate_image_list(images)
 
 
 class ReferenceChainConditioningBase64:

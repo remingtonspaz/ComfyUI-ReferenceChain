@@ -39,6 +39,14 @@ Same functionality but accepts base64-encoded images. Ideal for API workflows.
 
 Or a single base64 string without JSON array wrapper.
 
+### Reference Image Bank
+
+Drag-and-drop image list that feeds nodes with growing image inputs, such as **Set Reference Multi Latent** and **Text Encode Qwen Image 2.1**.
+
+- One `IMAGE` output per image (up to 16). `image_1` is always present and sends nothing when the bank is empty, which those nodes skip.
+- Connect `image_1` to the target's first image slot once. Each image you add is wired into the target's next slot automatically; removing an image unwires the last output and the target closes the gap. Output N always carries bank image N.
+- If `image_1` feeds several nodes, all of them are wired.
+
 ## Installation
 
 ### Via ComfyUI Manager

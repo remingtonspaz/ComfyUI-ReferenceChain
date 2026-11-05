@@ -42,6 +42,8 @@ class ImageListWidget {
 
         // Hover/drag state for drop zone
         this.dropZoneActive = false;
+
+        this.maxImages = Infinity;
     }
 
     get images() {
@@ -57,6 +59,7 @@ class ImageListWidget {
     setImages(images) {
         this.valueWidget.value = JSON.stringify(images);
         this.preloadImages();
+        this.node.onImageListChanged?.();
         this.updateNodeSize();
     }
 
@@ -107,6 +110,10 @@ class ImageListWidget {
     addImage(filename) {
         const images = this.images;
         if (filename && !images.includes(filename)) {
+            if (images.length >= this.maxImages) {
+                showWarning(`Only ${this.maxImages} images fit in this node; ${filename} was not added.`);
+                return;
+            }
             images.push(filename);
             this.setImages(images);
         }
@@ -145,8 +152,9 @@ class ImageListWidget {
             }
         }
 
-        // Title bar + header space (~70px) + other widgets + this widget's height
-        const headerSpace = 70;
+        // Input/output slot rows (at least ~70px) + other widgets + this widget's height
+        const slotRows = Math.max(this.node.inputs?.length || 0, this.node.outputs?.length || 0);
+        const headerSpace = Math.max(70, slotRows * LiteGraph.NODE_SLOT_HEIGHT + 10);
         const idealHeight = headerSpace + otherWidgetsHeight + widgetHeight;
         const minHeight = 200;
 
@@ -498,8 +506,165 @@ class ImageListWidget {
     }
 }
 
+const BANK_MAX_IMAGES = 16;  // matches ReferenceImageBank.MAX_IMAGES in nodes.py
+
 function getImageListWidget(node) {
     return node.widgets?.find((w) => w.isReferenceChainList);
+}
+
+function showWarning(detail) {
+    app.extensionManager?.toast?.add({ severity: "warn", summary: "ReferenceChain", detail, life: 5000 });
+}
+
+/**
+ * Keep the "images" STRING widget as the serialized value (same position, so old
+ * workflows restore into it) and show a display-only list widget right after it
+ */
+function addImageList(node) {
+    const imagesWidget = node.widgets?.find((w) => w.name === "images");
+    if (!imagesWidget) return;
+    imagesWidget.hidden = true;
+
+    const listWidget = node.addCustomWidget(new ImageListWidget(node, imagesWidget));
+    node.widgets.splice(node.widgets.indexOf(listWidget), 1);
+    node.widgets.splice(node.widgets.indexOf(imagesWidget) + 1, 0, listWidget);
+    return listWidget;
+}
+
+/**
+ * Drag and drop, paste, and resize-on-load for nodes that carry an image list
+ */
+function addImageListHandlers(nodeType) {
+    // Resize to fit images restored from a saved workflow
+    const onConfigure = nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure = function () {
+        const result = onConfigure?.apply(this, arguments);
+        getImageListWidget(this)?.updateNodeSize();
+        return result;
+    };
+
+    const onDragOver = nodeType.prototype.onDragOver;
+    nodeType.prototype.onDragOver = function (e) {
+        const result = onDragOver?.apply(this, arguments);
+
+        if (e.dataTransfer?.types?.includes("Files")) {
+            e.preventDefault();
+
+            // Update drop zone highlight
+            const widget = getImageListWidget(this);
+            if (widget && !widget.dropZoneActive) {
+                widget.dropZoneActive = true;
+                this.setDirtyCanvas(true, true);
+            }
+
+            return true;
+        }
+
+        return result;
+    };
+
+    const onDragLeave = nodeType.prototype.onDragLeave;
+    nodeType.prototype.onDragLeave = function (e) {
+        const result = onDragLeave?.apply(this, arguments);
+
+        // Clear drop zone highlight
+        const widget = getImageListWidget(this);
+        if (widget?.dropZoneActive) {
+            widget.dropZoneActive = false;
+            this.setDirtyCanvas(true, true);
+        }
+
+        return result;
+    };
+
+    const onDragDrop = nodeType.prototype.onDragDrop;
+    nodeType.prototype.onDragDrop = async function (e) {
+        // Clear drop zone highlight
+        const widget = getImageListWidget(this);
+        if (widget) {
+            widget.dropZoneActive = false;
+            this.setDirtyCanvas(true, true);
+        }
+
+        if (widget && e.dataTransfer?.files?.length > 0) {
+            for (const file of e.dataTransfer.files) {
+                if (file.type.startsWith("image/")) {
+                    await widget.uploadImage(file);
+                }
+            }
+            return true;
+        }
+
+        return onDragDrop?.apply(this, arguments);
+    };
+
+    const onPaste = nodeType.prototype.onPaste;
+    nodeType.prototype.onPaste = async function (e) {
+        const widget = getImageListWidget(this);
+        if (widget) {
+            for (const item of e.clipboardData?.items ?? []) {
+                if (item.type.startsWith("image/")) {
+                    const file = item.getAsFile();
+                    if (file) {
+                        await widget.uploadImage(file);
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return onPaste?.apply(this, arguments);
+    };
+}
+
+/**
+ * Show one output per image, always keeping image_1. Outputs past the image count
+ * are dropped from the end, so output N keeps carrying bank image N.
+ */
+function syncBankOutputs(node) {
+    const count = Math.max(1, Math.min(getImageListWidget(node)?.images.length ?? 0, BANK_MAX_IMAGES));
+    while (node.outputs.length > count) {
+        const slot = node.outputs.length - 1;
+        node.disconnectOutput(slot);
+        node.removeOutput(slot);
+    }
+    while (node.outputs.length < count) {
+        node.addOutput(`image_${node.outputs.length + 1}`, "IMAGE");
+    }
+}
+
+/**
+ * For every autogrow input image_1 feeds, connect the remaining outputs to the
+ * group's trailing free slot one at a time. Each connect makes the target grow
+ * its next slot, so the outputs land in order.
+ */
+function wireBankOutputs(node) {
+    const graph = node.graph;
+    if (!graph) return;
+
+    for (const linkId of node.outputs[0]?.links ?? []) {
+        const link = graph.getLink(linkId);
+        const target = link && graph.getNodeById(link.target_id);
+        const input = target?.inputs?.[link.target_slot];
+        if (!input) continue;
+
+        const group = input.name.slice(0, input.name.lastIndexOf("."));
+        if (!target.comfyDynamic?.autogrow?.[group]) continue;
+
+        for (let slot = 1; slot < node.outputs.length; slot++) {
+            const alreadyLinked = (node.outputs[slot].links ?? []).some(
+                (id) => graph.getLink(id)?.target_id === target.id
+            );
+            if (alreadyLinked) continue;
+
+            const free = target.inputs.findLastIndex((inp) => inp.name.startsWith(group + "."));
+            if (free === -1 || target.inputs[free].link != null) {
+                showWarning(`${target.title} has no free image slot left; image_${slot + 1} and later were not connected.`);
+                break;
+            }
+            node.connect(slot, target, free);
+        }
+    }
 }
 
 /**
@@ -509,157 +674,83 @@ app.registerExtension({
     name: "Comfy.ReferenceChain",
 
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
-        if (nodeData.name !== "ReferenceChainConditioning") {
-            return;
+        if (nodeData.name === "ReferenceChainConditioning") {
+            const onNodeCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                const result = onNodeCreated?.apply(this, arguments);
+
+                addImageList(this)?.updateNodeSize();
+
+                // Remove the default image_input_1 slot (created from optional INPUT_TYPES)
+                // since image_input_node_count defaults to 0
+                const defaultImageInput = this.inputs?.findIndex(input => input.name === "image_input_1");
+                if (defaultImageInput !== undefined && defaultImageInput >= 0) {
+                    this.removeInput(defaultImageInput);
+                }
+
+                // Add "Update image inputs" button for dynamic IMAGE input slots
+                this.addWidget("button", "Update image inputs", null, () => {
+                    if (!this.inputs) {
+                        this.inputs = [];
+                    }
+                    const target = this.widgets.find(w => w.name === "image_input_node_count")?.value || 0;
+                    const current = this.inputs.filter(input => input.type === "IMAGE").length;
+                    if (target === current) return;
+
+                    if (target < current) {
+                        // Remove excess IMAGE inputs from the end
+                        for (let i = 0; i < current - target; i++) {
+                            // Find the last IMAGE input and remove it
+                            for (let j = this.inputs.length - 1; j >= 0; j--) {
+                                if (this.inputs[j].type === "IMAGE") {
+                                    this.removeInput(j);
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        // Add new IMAGE inputs
+                        for (let i = current + 1; i <= target; i++) {
+                            this.addInput(`image_input_${i}`, "IMAGE", { shape: 7 });
+                        }
+                    }
+                });
+
+                return result;
+            };
+
+            addImageListHandlers(nodeType);
         }
 
-        // Store original onNodeCreated
-        const onNodeCreated = nodeType.prototype.onNodeCreated;
+        if (nodeData.name === "ReferenceImageBank") {
+            const onNodeCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                const result = onNodeCreated?.apply(this, arguments);
 
-        nodeType.prototype.onNodeCreated = function () {
-            const result = onNodeCreated?.apply(this, arguments);
+                const listWidget = addImageList(this);
+                if (listWidget) listWidget.maxImages = BANK_MAX_IMAGES;
+                syncBankOutputs(this);
+                listWidget?.updateNodeSize();
 
-            // Keep the "images" STRING widget as the serialized value (same position, so old
-            // workflows restore into it) and show a display-only list widget right after it
-            const imagesWidget = this.widgets?.find((w) => w.name === "images");
-            if (imagesWidget) {
-                imagesWidget.hidden = true;
+                return result;
+            };
 
-                const listWidget = this.addCustomWidget(new ImageListWidget(this, imagesWidget));
-                this.widgets.splice(this.widgets.indexOf(listWidget), 1);
-                this.widgets.splice(this.widgets.indexOf(imagesWidget) + 1, 0, listWidget);
+            nodeType.prototype.onImageListChanged = function () {
+                syncBankOutputs(this);
+                wireBankOutputs(this);
+            };
 
-                listWidget.updateNodeSize();
-            }
-
-            // Remove the default image_input_1 slot (created from optional INPUT_TYPES)
-            // since image_input_node_count defaults to 0
-            const defaultImageInput = this.inputs?.findIndex(input => input.name === "image_input_1");
-            if (defaultImageInput !== undefined && defaultImageInput >= 0) {
-                this.removeInput(defaultImageInput);
-            }
-
-            // Add "Update image inputs" button for dynamic IMAGE input slots
-            this.addWidget("button", "Update image inputs", null, () => {
-                if (!this.inputs) {
-                    this.inputs = [];
+            // Wiring image_1 by hand wires the rest of the bank to the same node
+            const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+            nodeType.prototype.onConnectionsChange = function (type, slot, connected) {
+                const result = onConnectionsChange?.apply(this, arguments);
+                if (type === LiteGraph.OUTPUT && slot === 0 && connected && !app.configuringGraph) {
+                    requestAnimationFrame(() => wireBankOutputs(this));
                 }
-                const target = this.widgets.find(w => w.name === "image_input_node_count")?.value || 0;
-                const current = this.inputs.filter(input => input.type === "IMAGE").length;
-                if (target === current) return;
+                return result;
+            };
 
-                if (target < current) {
-                    // Remove excess IMAGE inputs from the end
-                    for (let i = 0; i < current - target; i++) {
-                        // Find the last IMAGE input and remove it
-                        for (let j = this.inputs.length - 1; j >= 0; j--) {
-                            if (this.inputs[j].type === "IMAGE") {
-                                this.removeInput(j);
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    // Add new IMAGE inputs
-                    for (let i = current + 1; i <= target; i++) {
-                        this.addInput(`image_input_${i}`, "IMAGE", { shape: 7 });
-                    }
-                }
-            });
-
-            return result;
-        };
-
-        // Resize to fit images restored from a saved workflow
-        const onConfigure = nodeType.prototype.onConfigure;
-        nodeType.prototype.onConfigure = function () {
-            const result = onConfigure?.apply(this, arguments);
-            getImageListWidget(this)?.updateNodeSize();
-            return result;
-        };
-
-        // Handle drag and drop
-        const onDragOver = nodeType.prototype.onDragOver;
-        nodeType.prototype.onDragOver = function (e) {
-            const result = onDragOver?.apply(this, arguments);
-
-            if (e.dataTransfer?.types?.includes("Files")) {
-                e.preventDefault();
-
-                // Update drop zone highlight
-                const widget = getImageListWidget(this);
-                if (widget) {
-                    if (!widget.dropZoneActive) {
-                        widget.dropZoneActive = true;
-                        this.setDirtyCanvas(true, true);
-                    }
-                }
-
-                return true;
-            }
-
-            return result;
-        };
-
-        const onDragLeave = nodeType.prototype.onDragLeave;
-        nodeType.prototype.onDragLeave = function (e) {
-            const result = onDragLeave?.apply(this, arguments);
-
-            // Clear drop zone highlight
-            const widget = getImageListWidget(this);
-            if (widget) {
-                if (widget.dropZoneActive) {
-                    widget.dropZoneActive = false;
-                    this.setDirtyCanvas(true, true);
-                }
-            }
-
-            return result;
-        };
-
-        const onDragDrop = nodeType.prototype.onDragDrop;
-        nodeType.prototype.onDragDrop = async function (e) {
-            // Clear drop zone highlight
-            const widget = getImageListWidget(this);
-            if (widget) {
-                widget.dropZoneActive = false;
-                this.setDirtyCanvas(true, true);
-            }
-
-            if (e.dataTransfer?.files?.length > 0) {
-                if (widget) {
-                    for (const file of e.dataTransfer.files) {
-                        if (file.type.startsWith("image/")) {
-                            await widget.uploadImage(file);
-                        }
-                    }
-                    return true;
-                }
-            }
-
-            return onDragDrop?.apply(this, arguments);
-        };
-
-        // Handle paste
-        const onPaste = nodeType.prototype.onPaste;
-        nodeType.prototype.onPaste = async function (e) {
-            const widget = getImageListWidget(this);
-            if (widget) {
-                const items = e.clipboardData?.items;
-                if (items) {
-                    for (const item of items) {
-                        if (item.type.startsWith("image/")) {
-                            const file = item.getAsFile();
-                            if (file) {
-                                await widget.uploadImage(file);
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-
-            return onPaste?.apply(this, arguments);
-        };
+            addImageListHandlers(nodeType);
+        }
     },
 });
