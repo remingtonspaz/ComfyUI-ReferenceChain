@@ -532,7 +532,7 @@ function addImageList(node) {
 }
 
 /**
- * Drag and drop, paste, and resize-on-load for nodes that carry an image list
+ * Drag and drop and resize-on-load for nodes that carry an image list
  */
 function addImageListHandlers(nodeType) {
     // Resize to fit images restored from a saved workflow
@@ -597,24 +597,32 @@ function addImageListHandlers(nodeType) {
 
         return onDragDrop?.apply(this, arguments);
     };
+}
 
-    const onPaste = nodeType.prototype.onPaste;
-    nodeType.prototype.onPaste = async function (e) {
-        const widget = getImageListWidget(this);
-        if (widget) {
-            for (const item of e.clipboardData?.items ?? []) {
-                if (item.type.startsWith("image/")) {
-                    const file = item.getAsFile();
-                    if (file) {
-                        await widget.uploadImage(file);
-                        return true;
-                    }
-                }
-            }
-        }
+/**
+ * The frontend's document paste handler never calls node.onPaste: it pastes only into
+ * nodes it treats as image previews and otherwise creates a LoadImage node. It skips
+ * pastes that are already cancelled, so claim image pastes aimed at a selected
+ * image-list node first.
+ */
+async function pasteIntoImageList(e) {
+    if (e.defaultPrevented) return;
+    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target?.isContentEditable) return;
 
-        return onPaste?.apply(this, arguments);
-    };
+    const node = app.canvas?.current_node;
+    const widget = node?.is_selected && getImageListWidget(node);
+    if (!widget) return;
+
+    const files = Array.from(e.clipboardData?.items ?? [])
+        .filter((item) => item.type.startsWith("image/"))
+        .map((item) => item.getAsFile())
+        .filter(Boolean);
+    if (!files.length) return;
+
+    e.preventDefault();
+    for (const file of files) {
+        await widget.uploadImage(file);
+    }
 }
 
 /**
@@ -672,6 +680,11 @@ function wireBankOutputs(node) {
  */
 app.registerExtension({
     name: "Comfy.ReferenceChain",
+
+    setup() {
+        // Capture phase, so this runs before the frontend's own document listener
+        document.addEventListener("paste", pasteIntoImageList, true);
+    },
 
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
         if (nodeData.name === "ReferenceChainConditioning") {
